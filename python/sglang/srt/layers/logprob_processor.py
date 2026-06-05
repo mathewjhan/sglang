@@ -109,12 +109,63 @@ def get_top_logprobs(
     )
 
 
+def _is_per_position_token_ids(token_ids) -> bool:
+    """True when a request's ``token_ids_logprob`` entry carries a separate id-list
+    *per input position* (``List[List[int]]``) instead of one flat id-list
+    (``List[int]``) broadcast to every position.
+
+    The per-position form lets OPD top-k scoring request only each position's own
+    ~k ids (sparse ``[R, k]``) instead of the global union applied to all positions
+    (dense ``[R, |union|]``), turning an O(R^2) teacher response into O(R*k).
+    Detection is per-request, so flat and per-position requests can share a batch.
+    """
+    return bool(token_ids) and isinstance(token_ids[0], list)
+
+
+def _gather_per_position_prefill(logprobs, pt, pruned_len, pos_ids, no_copy_to_cpu):
+    """Gather logprobs when each pruned position has its own id-list.
+
+    ``pos_ids`` is a ``List[List[int]]`` aligned to the request's pruned positions
+    (positions with no requested ids carry an empty list, e.g. the prompt prefix when
+    only response positions are scored). Returns a list-over-positions of logprob
+    lists, mirroring the flat path's per-position output structure.
+
+    When the non-empty positions all share width ``k`` (the common OPD top-k case),
+    they are gathered in a single rectangular advanced-index op even if interleaved
+    with empty positions -- so a ``[]``-padded prompt prefix stays O(R*k), not a
+    per-position Python loop.
+    """
+    pos_ids = pos_ids[:pruned_len]
+    out = [[] for _ in range(pruned_len)]
+    nonempty = [j for j in range(len(pos_ids)) if len(pos_ids[j]) > 0]
+    if not nonempty:
+        return out
+    widths = {len(pos_ids[j]) for j in nonempty}
+    if len(widths) == 1:
+        rows = torch.tensor(
+            [pt + j for j in nonempty], dtype=torch.long, device=logprobs.device
+        ).unsqueeze(1)
+        cols = torch.tensor(
+            [pos_ids[j] for j in nonempty], dtype=torch.long, device=logprobs.device
+        )
+        gathered = logprobs[rows, cols].tolist()  # [len(nonempty), k]
+        for m, j in enumerate(nonempty):
+            out[j] = gathered[m]
+        return out
+    # Ragged widths (rare): fall back to a per-position gather.
+    for j in nonempty:
+        ids_tensor = torch.tensor(pos_ids[j], dtype=torch.long, device=logprobs.device)
+        out[j] = logprobs[pt + j, ids_tensor].tolist()
+    return out
+
+
 def get_token_ids_logprobs_raw(
     logprobs: torch.Tensor,
     token_ids_logprobs_list: List[Optional[List[int]]],
     stage: LogprobStage,
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
     no_copy_to_cpu: bool = False,
+    global_start_pos_cpu: Optional[List[int]] = None,
 ):
     vals, idxs = [], []
     if stage == LogprobStage.DECODE:
@@ -123,6 +174,11 @@ def get_token_ids_logprobs_raw(
                 vals.append([])
                 idxs.append([])
             else:
+                # Per-position ids are a prefill/scoring-only feature (max_new_tokens=0);
+                # they have no meaning for decode, where there is a single new position.
+                assert not _is_per_position_token_ids(
+                    token_ids
+                ), "per-position token_ids_logprob is only supported for prefill/scoring requests"
                 token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
                     logprobs.device, non_blocking=True
                 )
@@ -144,12 +200,39 @@ def get_token_ids_logprobs_raw(
                 idxs.append([])
                 pt += pruned_len
                 continue
-            token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
-                logprobs.device, non_blocking=True
-            )
-            pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
-            vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
-            idxs.append([token_ids for _ in range(pruned_len)])
+            if _is_per_position_token_ids(token_ids):
+                # Align each pruned row to the absolute input position it scores.
+                # Pruned row r holds the logits that *generated* token
+                # (start_len + r + 1); the response assembler then prepends a None
+                # for position 0 and pops the trailing sample row (see
+                # scheduler_output_processor_mixin._process_input_token_ids_logprobs),
+                # so a per-position list indexed by absolute position lines up 1:1
+                # with the returned input_token_ids_logprobs. start_len is the absolute
+                # position of this request's first pruned row (= len(prefix_indices) +
+                # extend_logprob_start_len); under chunked prefill the pruned region is
+                # only a slice of the full sequence, so it must come from
+                # global_start_pos_cpu rather than len(token_ids) - pruned_len (which is
+                # only correct when the whole sequence is covered in one forward pass).
+                start_len = (
+                    global_start_pos_cpu[i]
+                    if global_start_pos_cpu is not None
+                    else len(token_ids) - pruned_len
+                )
+                shifted = token_ids[start_len + 1 : start_len + 1 + pruned_len]
+                pos_ids = shifted + [[] for _ in range(pruned_len - len(shifted))]
+                vals.append(
+                    _gather_per_position_prefill(
+                        logprobs, pt, pruned_len, pos_ids, no_copy_to_cpu
+                    )
+                )
+                idxs.append([list(x) for x in pos_ids])
+            else:
+                token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
+                    logprobs.device, non_blocking=True
+                )
+                pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
+                vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
+                idxs.append([token_ids for _ in range(pruned_len)])
             pt += pruned_len
     return vals, idxs
 
@@ -240,6 +323,7 @@ def get_token_ids_logprobs_chunk(
     token_ids_logprobs_val: List,
     token_ids_logprobs_idx: List,
     split_pruned_len: int = 0,
+    global_start_pos: Optional[List[int]] = None,
 ):
     """Get token_ids logprobs for each sequence in the chunk.
 
@@ -250,6 +334,10 @@ def get_token_ids_logprobs_chunk(
         token_ids_logprobs_val: List to store token logprob values
         token_ids_logprobs_idx: List to store token indices
         split_pruned_len: Length of pruned tokens from previous chunk
+        global_start_pos: Absolute position of each sequence's first pruned row
+            (= len(prefix_indices) + extend_logprob_start_len). Required for correct
+            per-position alignment under chunked prefill, where pruned_lens are
+            per-forward-pass while the per-position id-list spans the full sequence.
 
     Returns:
         int: Number of remaining tokens to process in next chunk
@@ -263,6 +351,10 @@ def get_token_ids_logprobs_chunk(
             pruned_lens,
         )
     ):
+        # Full pruned length of this sequence (before subtracting the part already
+        # emitted in a previous chunk); used to recover extend_logprob_start_len for
+        # per-position alignment.
+        orig_pruned_len = pruned_len
         # Adjust pruned length for first sequence
         if n == 0:
             pruned_len -= split_pruned_len
@@ -279,14 +371,47 @@ def get_token_ids_logprobs_chunk(
         # Get the token ids logprobs
         val = []
         idx = []
+        per_position = _is_per_position_token_ids(token_ids)
+        # Per-position lists are indexed by absolute input position, but pruned row r
+        # carries the logits that *generated* token (start_len + r + 1). The response
+        # assembler later prepends a None for position 0 and pops the trailing sample
+        # row, so shifting the lookup by start_len + 1 makes the returned
+        # input_token_ids_logprobs line up 1:1 with the caller's per-position list.
+        # start_len is the absolute position of this sequence's first pruned row; under
+        # chunked prefill this is only a slice of the full sequence, so it must come
+        # from global_start_pos rather than len(token_ids) - orig_pruned_len (correct
+        # only when the whole sequence is covered in one forward pass).
+        if per_position:
+            start_len = (
+                global_start_pos[n]
+                if global_start_pos is not None
+                else len(token_ids) - orig_pruned_len
+            )
+            per_position_start = start_len + 1
+        else:
+            per_position_start = 0
         for j in range(pruned_len):
             # Handle remaining tokens in next chunk if any
             if pt + j >= logprobs.shape[0]:
                 next_split_pruned_len = split_pruned_len + j
                 break
             if token_ids is not None:
-                val.append(logprobs[pt + j, token_ids].tolist())
-                idx.append(token_ids)
+                if per_position:
+                    # Absolute row across chunks is split_pruned_len + j; the scored
+                    # token is one position ahead (the sample/popped tail row falls off
+                    # the end and is padded empty).
+                    abs_idx = per_position_start + split_pruned_len + j
+                    ids = token_ids[abs_idx] if abs_idx < len(token_ids) else []
+                    val.append(
+                        logprobs[
+                            pt + j,
+                            torch.tensor(ids, dtype=torch.long, device=logprobs.device),
+                        ].tolist()
+                    )
+                    idx.append(ids)
+                else:
+                    val.append(logprobs[pt + j, token_ids].tolist())
+                    idx.append(token_ids)
 
         # Split-sequence continuations extend; everyone else owns a fresh
         # (possibly empty) entry.
@@ -530,6 +655,11 @@ class InputLogprobProcessor:
                 pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
                     chunk_slice
                 ]
+                global_start_pos = (
+                    logits_metadata.extend_logprob_start_pos_cpu[chunk_slice]
+                    if logits_metadata.extend_logprob_start_pos_cpu is not None
+                    else None
+                )
                 split_len_token_ids = get_token_ids_logprobs_chunk(
                     chunk_logprobs,
                     token_ids_logprobs,
@@ -537,6 +667,7 @@ class InputLogprobProcessor:
                     token_ids_logprobs_val,
                     token_ids_logprobs_idx,
                     split_len_token_ids,
+                    global_start_pos,
                 )
 
             # Get the logprob of the requested token ids
@@ -599,6 +730,13 @@ def get_token_ids_logprobs_batch_optimized(
     """
     batch_size = len(token_ids_logprobs)
     device = logprobs.device
+
+    # Per-position id-lists (List[List[int]]) belong to the input-logprob path;
+    # flattening them here would silently gather garbage. Callers filter them out
+    # (see OutputLogprobProcessor); fail loudly if one leaks through.
+    assert not any(
+        _is_per_position_token_ids(token_ids) for token_ids in token_ids_logprobs
+    ), "per-position token_ids_logprob has no next-token meaning; filter it out upstream"
 
     # Step 1: Calculate lengths for each request, treating None as empty list
     # Example: [[1, 3], [2], [0, 2, 4]] -> token_lengths = tensor([2, 1, 3])
@@ -684,12 +822,18 @@ class OutputLogprobProcessor:
                 result.top_logprobs_idx,
             ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 
-        if any(x is not None for x in token_ids_logprobs):
+        # Per-position token_ids_logprob entries (List[List[int]]) are an input-position
+        # scoring feature with no next-token meaning; they are served by the input-logprob
+        # path, so exclude them from the next-token gather.
+        flat_token_ids_logprobs = [
+            None if _is_per_position_token_ids(t) else t for t in token_ids_logprobs
+        ]
+        if any(x is not None for x in flat_token_ids_logprobs):
             (
                 result.token_ids_logprobs_val,
                 result.token_ids_logprobs_idx,
             ) = get_token_ids_logprobs(
-                logprobs, token_ids_logprobs, no_copy_to_cpu=True
+                logprobs, flat_token_ids_logprobs, no_copy_to_cpu=True
             )
 
         result.token_logprobs = logprobs[
@@ -716,6 +860,11 @@ class OutputLogprobProcessor:
             logger.warning("No logits available for logprob computation")
             return None
 
+        # Per-position entries are served by the input-logprob path; exclude them from
+        # the next-token gather (see compute_logprobs).
+        token_ids_logprobs = [
+            None if _is_per_position_token_ids(t) else t for t in token_ids_logprobs
+        ]
         # Check if any requests actually need logprobs computation
         needs_token_ids_logprobs = any(
             token_ids is not None and len(token_ids) > 0
