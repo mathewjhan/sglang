@@ -1748,6 +1748,8 @@ class AbortReq(BaseReq):
     # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
     abort_message: Optional[str] = None
+    # Match rid as a prefix instead of exactly.
+    prefix: bool = False
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
