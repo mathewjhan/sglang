@@ -14,6 +14,7 @@
 
 
 import asyncio
+import logging
 from collections import OrderedDict
 from typing import Dict, List, Optional, Union
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -23,6 +24,8 @@ from msgspec.structs import fields
 
 from sglang.srt.utils import ConcurrentCounter
 from sglang.srt.utils.aio_rwlock import RWLock
+
+logger = logging.getLogger(__name__)
 
 
 class LoRARef(msgspec.Struct, frozen=True, array_like=True):
@@ -199,6 +202,14 @@ class LoRARegistry:
         ), "The LoRA ID should still have a counter if it has been registered before."
 
         # Wait until no requests are using this LoRA adapter.
+        count = self._counters[lora_id].value()
+        if count != 0:
+            logger.info(
+                "Unload of LoRA %s waiting for usage counter to drain (current=%d); "
+                "a nonzero value that never drains means a leaked/over-released counter.",
+                lora_id,
+                count,
+            )
         await self._counters[lora_id].wait_for_zero()
         del self._counters[lora_id]
 

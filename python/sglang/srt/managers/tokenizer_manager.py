@@ -1498,9 +1498,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state.obj.rid in self.rid_to_state:
                 del self.rid_to_state[state.obj.rid]
 
-            # Mark ongoing LoRA request as finished.
-            if self.enable_lora and state.obj.lora_path:
-                await self.lora_registry.release(state.obj.lora_id)
+            # LoRA counter already released by the handler that delivered this output;
+            # releasing again would drive it negative and wedge wait_for_unload.
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -2824,6 +2823,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.finished = True
         state.time_stats.set_finished_time()
 
+        # Only completion path for requests aborted outside the running batch (e.g.
+        # waiting-queue pops); without this release, unload_lora_adapter hangs forever.
+        if self.enable_lora and state.obj.lora_path:
+            asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {
             "type": "abort",
@@ -3070,7 +3074,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             rids = obj.rid
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            state = self.rid_to_state.pop(rid, None)
+            # lora_id is only set after a successful acquire, and no scheduler echo
+            # can release it once the rid is gone; pop() gates exactly-once release.
+            if (
+                state is not None
+                and self.enable_lora
+                and getattr(state.obj, "lora_path", None)
+                and getattr(state.obj, "lora_id", None)
+            ):
+                asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
